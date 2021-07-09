@@ -21,16 +21,27 @@
 package cloudapi
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"io/ioutil"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/mailru/easyjson"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/lib/testutils"
+	"go.k6.io/k6/lib/testutils/httpmultibin"
 )
 
 func TestMsgParsing(t *testing.T) {
@@ -122,4 +133,224 @@ func TestMSGLog(t *testing.T) {
 		require.Equal(t, expectedMsg, entry.Message)
 		require.Equal(t, expectTime, entry.Time)
 	}
+}
+
+func TestRetry(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Success", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name     string
+			attempts int
+			expWaits []time.Duration // pow(abs(interval), attempt index)
+		}{
+			{
+				name:     "NoRetry",
+				attempts: 1,
+			},
+			{
+				name:     "TwoAttempts",
+				attempts: 2,
+				expWaits: []time.Duration{5 * time.Second},
+			},
+			{
+				name:     "MaximumExceeded",
+				attempts: 4,
+				expWaits: []time.Duration{5 * time.Second, 25 * time.Second, 2 * time.Minute},
+			},
+			{
+				name:     "AttemptsLimit",
+				attempts: 5,
+				expWaits: []time.Duration{5 * time.Second, 25 * time.Second, 2 * time.Minute, 2 * time.Minute},
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				var sleepRequests []time.Duration
+				// sleepCollector tracks the request duration value for sleep requests.
+				sleepCollector := sleeperFunc(func(d time.Duration) {
+					sleepRequests = append(sleepRequests, d)
+				})
+
+				var iterations int
+				err := retry(sleepCollector, 5, 5*time.Second, 2*time.Minute, func() error {
+					iterations++
+					if iterations < tt.attempts {
+						return fmt.Errorf("unexpected error")
+					}
+					return nil
+				})
+				require.NoError(t, err)
+				require.Equal(t, tt.attempts, iterations)
+				require.Equal(t, len(tt.expWaits), len(sleepRequests))
+
+				// the added random milliseconds makes difficult to know the exact value
+				// so it asserts that expwait <= actual <= expwait + 1s
+				for i, expwait := range tt.expWaits {
+					assert.GreaterOrEqual(t, sleepRequests[i], expwait)
+					assert.LessOrEqual(t, sleepRequests[i], expwait+(1*time.Second))
+				}
+			})
+		}
+	})
+	t.Run("Fail", func(t *testing.T) {
+		t.Parallel()
+
+		mock := sleeperFunc(func(time.Duration) { /* noop - nowait */ })
+		err := retry(mock, 5, 5*time.Second, 30*time.Second, func() error {
+			return fmt.Errorf("unexpected error")
+		})
+
+		assert.Error(t, err, "unexpected error")
+	})
+}
+
+func TestStreamLogsToLogger(t *testing.T) {
+	t.Parallel()
+
+	// It registers an handler for the logtail endpoint
+	// It upgrades as websocket the HTTP handler and invokes the provided callback.
+	logtailHandleFunc := func(tb *httpmultibin.HTTPMultiBin, fn func(*websocket.Conn, *http.Request)) {
+		upgrader := websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+		}
+		tb.Mux.HandleFunc("/api/v1/tail", func(w http.ResponseWriter, req *http.Request) {
+			conn, err := upgrader.Upgrade(w, req, nil)
+			require.NoError(t, err)
+
+			fn(conn, req)
+			_ = conn.Close()
+		})
+	}
+
+	// a basic config with the logtail endpoint set
+	configFromHTTPMultiBin := func(tb *httpmultibin.HTTPMultiBin) Config {
+		wsurl := strings.TrimPrefix(tb.ServerHTTP.URL, "http://")
+		return Config{
+			LogsTailURL: null.NewString(fmt.Sprintf("ws://%s/api/v1/tail", wsurl), false),
+		}
+	}
+
+	// get all messages from the mocked logger
+	logLines := func(hook *testutils.SimpleLogrusHook) (lines []string) {
+		for _, e := range hook.Drain() {
+			lines = append(lines, e.Message)
+		}
+		return
+	}
+
+	t.Run("Success", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		tb := httpmultibin.NewHTTPMultiBin(t)
+		logtailHandleFunc(tb, func(conn *websocket.Conn, _ *http.Request) {
+			msgfmt := `{"streams":[{"stream":{"key1":%q,"level":"warn"},"values":[["1598282752000000000",%q]]}],"dropped_entities":[]}`
+
+			b := json.RawMessage(fmt.Sprintf(msgfmt, "value1", "logline1"))
+			err := conn.WriteJSON(b)
+			require.NoError(t, err)
+
+			b = json.RawMessage([]byte(fmt.Sprintf(msgfmt, "value2", "logline2")))
+			err = conn.WriteJSON(b)
+			require.NoError(t, err)
+
+			// wait the flush on the network
+			time.Sleep(time.Millisecond)
+			cancel()
+		})
+
+		logger := logrus.New()
+		logger.Out = ioutil.Discard
+		hook := &testutils.SimpleLogrusHook{HookedLevels: logrus.AllLevels}
+		logger.AddHook(hook)
+
+		c := configFromHTTPMultiBin(tb)
+		err := c.StreamLogsToLogger(ctx, logger, "ref_id", 0)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"logline1", "logline2"}, logLines(hook))
+	})
+
+	t.Run("RestoreConn", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		startFilter := func(u url.URL) (start time.Time, err error) {
+			rawstart, err := strconv.ParseInt(u.Query().Get("start"), 10, 64)
+			if err != nil {
+				return start, err
+			}
+
+			start = time.Unix(0, rawstart)
+			return
+		}
+
+		var (
+			firstAttempt time.Time
+			m            sync.Mutex
+		)
+
+		tb := httpmultibin.NewHTTPMultiBin(t)
+		logtailHandleFunc(tb, func(conn *websocket.Conn, req *http.Request) {
+			start, err := startFilter(*req.URL)
+			require.NoError(t, err)
+
+			m.Lock()
+			attempt := firstAttempt
+			m.Unlock()
+
+			if attempt.IsZero() {
+				// if it's the first attempt then
+				// it generates a failure closing the connection
+				// in a rude way
+				err = conn.Close()
+				if err != nil {
+					return
+				}
+
+				m.Lock()
+				firstAttempt = start
+				m.Unlock()
+				return
+			}
+
+			// it asserts that the second attempt
+			// has a `start` after the first
+			require.True(t, start.After(firstAttempt))
+
+			// send a correct logline so we will able to assert
+			// that the connection is restored as expected
+			err = conn.WriteJSON(json.RawMessage(`{"streams":[{"stream":{"key1":"v1","level":"warn"},"values":[["1598282752000000000","logline-after-restored-conn"]]}],"dropped_entities":[]}`))
+			require.NoError(t, err)
+
+			time.Sleep(time.Millisecond)
+			cancel()
+		})
+
+		logger := logrus.New()
+		logger.Out = ioutil.Discard
+		hook := &testutils.SimpleLogrusHook{HookedLevels: logrus.AllLevels}
+		logger.AddHook(hook)
+
+		c := configFromHTTPMultiBin(tb)
+		err := c.StreamLogsToLogger(ctx, logger, "ref_id", 0)
+		require.NoError(t, err)
+
+		assert.NotZero(t, firstAttempt)
+		assert.Equal(t,
+			[]string{
+				"error reading a message from the cloud",
+				"trying to establish a fresh connection with the tail logs, this might result in either some repeated or missed messages",
+				"logline-after-restored-conn",
+			}, logLines(hook))
+	})
 }

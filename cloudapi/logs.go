@@ -23,9 +23,12 @@ package cloudapi
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -92,42 +95,47 @@ func labelsToLogrusFields(labels map[string]string) logrus.Fields {
 	return fields
 }
 
-func (c *Config) getRequest(referenceID string, start time.Duration) (*url.URL, error) {
+func (c *Config) logtailConn(ctx context.Context, referenceID string, since time.Time) (*websocket.Conn, error) {
 	u, err := url.Parse(c.LogsTailURL.String)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't parse cloud logs host %w", err)
 	}
 
-	u.RawQuery = fmt.Sprintf(`query={test_run_id="%s"}&start=%d`,
-		referenceID,
-		time.Now().Add(-start).UnixNano(),
-	)
+	u.RawQuery = fmt.Sprintf(`query={test_run_id="%s"}&start=%d`, referenceID, since.UnixNano())
 
-	return u, nil
+	headers := make(http.Header)
+	headers.Add("Sec-WebSocket-Protocol", "token="+c.Token.String)
+
+	var conn *websocket.Conn
+	err = retry(sleeperFunc(time.Sleep), 3, 5*time.Second, 2*time.Minute, func() (err error) {
+		// We don't need to close the http body or use it for anything until we want to actually log
+		// what the server returned as body when it errors out
+		conn, _, err = websocket.DefaultDialer.DialContext(ctx, u.String(), headers) //nolint:bodyclose
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // StreamLogsToLogger streams the logs for the configured test to the provided logger until ctx is
 // Done or an error occurs.
 func (c *Config) StreamLogsToLogger(
-	ctx context.Context, logger logrus.FieldLogger, referenceID string, start time.Duration,
+	ctx context.Context, logger logrus.FieldLogger, referenceID string, tailFrom time.Duration,
 ) error {
-	u, err := c.getRequest(referenceID, start)
-	if err != nil {
-		return err
-	}
+	var mconn sync.Mutex
 
-	headers := make(http.Header)
-	headers.Add("Sec-WebSocket-Protocol", "token="+c.Token.String)
-
-	// We don't need to close the http body or use it for anything until we want to actually log
-	// what the server returned as body when it errors out
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), headers) //nolint:bodyclose
+	conn, err := c.logtailConn(ctx, referenceID, time.Now().Add(-tailFrom))
 	if err != nil {
 		return err
 	}
 
 	go func() {
 		<-ctx.Done()
+
+		mconn.Lock()
+		defer mconn.Unlock()
 
 		_ = conn.WriteControl(
 			websocket.CloseMessage,
@@ -138,7 +146,6 @@ func (c *Config) StreamLogsToLogger(
 	}()
 
 	msgBuffer := make(chan []byte, 10)
-
 	defer close(msgBuffer)
 
 	go func() {
@@ -166,6 +173,18 @@ func (c *Config) StreamLogsToLogger(
 		if err != nil {
 			logger.WithError(err).Warn("error reading a message from the cloud")
 
+			// try to restore the stream establishing a new connection
+			logger.Warn("trying to establish a fresh connection with the tail logs, this might result in either some repeated or missed messages") //nolint:lll
+
+			newconn, errd := c.logtailConn(ctx, referenceID, time.Now())
+			if errd == nil {
+				mconn.Lock()
+				conn = newconn
+				mconn.Unlock()
+				continue
+			}
+
+			// return the main error
 			return err
 		}
 
@@ -175,4 +194,44 @@ func (c *Config) StreamLogsToLogger(
 		case msgBuffer <- message:
 		}
 	}
+}
+
+// sleeper represents an abstraction for waiting an amount of time.
+type sleeper interface {
+	Sleep(d time.Duration)
+}
+
+// sleeperFunc uses the underhood function for implementing the wait operation.
+type sleeperFunc func(time.Duration)
+
+func (sfn sleeperFunc) Sleep(d time.Duration) {
+	sfn(d)
+}
+
+// retry retries to execute a provided function until it isn't successful
+// or the maximum number of attempts is hit. It waits the specified interval
+// between the latest iteration and the next retry.
+// Interval is used as the base to compute an exponential backoff,
+// if the computed interval overtakes the max interval then max will be used.
+func retry(s sleeper, attempts uint, interval, max time.Duration, do func() error) (err error) {
+	baseInterval := math.Abs(interval.Truncate(time.Second).Seconds())
+	r := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
+
+	for i := 0; i < int(attempts); i++ {
+		if i > 0 {
+			// wait = (interval ^ i) + random milliseconds
+			wait := time.Duration(math.Pow(baseInterval, float64(i))) * time.Second
+			wait += time.Duration(r.Int63n(1000)) * time.Millisecond
+
+			if wait > max {
+				wait = max
+			}
+			s.Sleep(wait)
+		}
+		err = do()
+		if err == nil {
+			return nil
+		}
+	}
+	return
 }

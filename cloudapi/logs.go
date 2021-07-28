@@ -198,7 +198,7 @@ func (c *Config) StreamLogsToLogger(
 		}
 
 		if err != nil {
-			logger.WithError(err).Warn("error reading a log message from the cloud, trying to establish a fresh connection with the logs service...")
+			logger.WithError(err).Warn("error reading a log message from the cloud, trying to establish a fresh connection with the logs service...") //nolint:lll
 
 			newconn, errd := c.logtailConn(ctx, referenceID, latest.TimeOrNow())
 			if errd == nil {
@@ -223,17 +223,16 @@ func (c *Config) StreamLogsToLogger(
 // timstampTrack is a safe-concurrent tracker
 // of the latest/most recent seen timestamp value.
 type timestampTrack struct {
-	// ts is timestmap in unix nano format
+	// ts is timestamp in unix nano format
 	ts int64
 }
 
 // TimeOrNow returns as Time the latest tracked value
 // or Now as the default value.
-func (tt *timestampTrack) TimeOrNow() (t time.Time) {
+func (tst *timestampTrack) TimeOrNow() (t time.Time) {
 	t = time.Now()
-	ts := atomic.LoadInt64(&tt.ts)
-	if ts > 0 {
-		t = time.Unix(0, int64(ts))
+	if ts := atomic.LoadInt64(&tst.ts); ts > 0 {
+		t = time.Unix(0, ts)
 	}
 	return
 }

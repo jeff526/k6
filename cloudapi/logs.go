@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -48,6 +49,23 @@ type msg struct {
 type msgStreams struct {
 	Stream map[string]string `json:"stream"`
 	Values [][2]string       `json:"values"` // this can be optimized
+}
+
+func (ms msgStreams) LatestTimestamp() (ts int64) {
+	if len(ms.Values) < 1 {
+		return
+	}
+	for i := 0; i < len(ms.Values); i++ {
+		raw := ms.Values[i][0]
+		unix, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return
+		}
+		if unix > ts {
+			ts = unix
+		}
+	}
+	return
 }
 
 //easyjson:json
@@ -148,6 +166,7 @@ func (c *Config) StreamLogsToLogger(
 	msgBuffer := make(chan []byte, 10)
 	defer close(msgBuffer)
 
+	latest := &timestampTrack{}
 	go func() {
 		for message := range msgBuffer {
 			var m msg
@@ -157,8 +176,16 @@ func (c *Config) StreamLogsToLogger(
 
 				continue
 			}
-
 			m.Log(logger)
+
+			var ts int64
+			for _, stream := range m.Streams {
+				sts := stream.LatestTimestamp()
+				if sts > ts {
+					ts = sts
+				}
+			}
+			latest.Set(ts)
 		}
 	}()
 
@@ -171,12 +198,9 @@ func (c *Config) StreamLogsToLogger(
 		}
 
 		if err != nil {
-			logger.WithError(err).Warn("error reading a message from the cloud")
+			logger.WithError(err).Warn("error reading a log message from the cloud, trying to establish a fresh connection with the logs service...")
 
-			// try to restore the stream establishing a new connection
-			logger.Warn("trying to establish a fresh connection with the tail logs, this might result in either some repeated or missed messages") //nolint:lll
-
-			newconn, errd := c.logtailConn(ctx, referenceID, time.Now())
+			newconn, errd := c.logtailConn(ctx, referenceID, latest.TimeOrNow())
 			if errd == nil {
 				mconn.Lock()
 				conn = newconn
@@ -194,6 +218,32 @@ func (c *Config) StreamLogsToLogger(
 		case msgBuffer <- message:
 		}
 	}
+}
+
+// timstampTrack is a safe-concurrent tracker
+// of the latest/most recent seen timestamp value.
+type timestampTrack struct {
+	// ts is timestmap in unix nano format
+	ts int64
+}
+
+// TimeOrNow returns as Time the latest tracked value
+// or Now as the default value.
+func (tt *timestampTrack) TimeOrNow() (t time.Time) {
+	t = time.Now()
+	ts := atomic.LoadInt64(&tt.ts)
+	if ts > 0 {
+		t = time.Unix(0, int64(ts))
+	}
+	return
+}
+
+// Set sets the tracked timestamp value.
+func (tst *timestampTrack) Set(ts int64) {
+	if ts < 1 {
+		return
+	}
+	atomic.StoreInt64(&tst.ts, ts)
 }
 
 // sleeper represents an abstraction for waiting an amount of time.

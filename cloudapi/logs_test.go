@@ -29,7 +29,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -243,6 +243,10 @@ func TestStreamLogsToLogger(t *testing.T) {
 		return
 	}
 
+	generateLogline := func(key string, ts uint64, msg string) string {
+		return fmt.Sprintf(`{"streams":[{"stream":{"key":%q,"level":"warn"},"values":[["%d",%q]]}],"dropped_entities":[]}`, key, ts, msg)
+	}
+
 	t.Run("Success", func(t *testing.T) {
 		t.Parallel()
 
@@ -251,14 +255,12 @@ func TestStreamLogsToLogger(t *testing.T) {
 
 		tb := httpmultibin.NewHTTPMultiBin(t)
 		logtailHandleFunc(tb, func(conn *websocket.Conn, _ *http.Request) {
-			msgfmt := `{"streams":[{"stream":{"key1":%q,"level":"warn"},"values":[["1598282752000000000",%q]]}],"dropped_entities":[]}`
-
-			b := json.RawMessage(fmt.Sprintf(msgfmt, "value1", "logline1"))
-			err := conn.WriteJSON(b)
+			rawmsg := json.RawMessage(generateLogline("stream1", 1598282752000000000, "logline1"))
+			err := conn.WriteJSON(rawmsg)
 			require.NoError(t, err)
 
-			b = json.RawMessage([]byte(fmt.Sprintf(msgfmt, "value2", "logline2")))
-			err = conn.WriteJSON(b)
+			rawmsg = json.RawMessage(generateLogline("stream2", 1598282752000000001, "logline2"))
+			err = conn.WriteJSON(rawmsg)
 			require.NoError(t, err)
 
 			// wait the flush on the network
@@ -278,7 +280,7 @@ func TestStreamLogsToLogger(t *testing.T) {
 		assert.Equal(t, []string{"logline1", "logline2"}, logLines(hook))
 	})
 
-	t.Run("RestoreConn", func(t *testing.T) {
+	t.Run("RestoreConnFromLatestMessage", func(t *testing.T) {
 		t.Parallel()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -294,44 +296,49 @@ func TestStreamLogsToLogger(t *testing.T) {
 			return
 		}
 
-		var (
-			firstAttempt time.Time
-			m            sync.Mutex
-		)
+		var requestsCount uint64
 
 		tb := httpmultibin.NewHTTPMultiBin(t)
 		logtailHandleFunc(tb, func(conn *websocket.Conn, req *http.Request) {
+			requests := atomic.AddUint64(&requestsCount, 1)
+
 			start, err := startFilter(*req.URL)
 			require.NoError(t, err)
 
-			m.Lock()
-			attempt := firstAttempt
-			m.Unlock()
+			if requests <= 1 {
+				t0 := time.Date(2021, time.July, 27, 0, 0, 0, 0, time.UTC).UnixNano()
+				t1 := time.Date(2021, time.July, 27, 1, 0, 0, 0, time.UTC).UnixNano()
+				t2 := time.Date(2021, time.July, 27, 2, 0, 0, 0, time.UTC).UnixNano()
 
-			if attempt.IsZero() {
-				// if it's the first attempt then
+				// send a correct logline so we will able to assert
+				// that the connection is restored as expected
+				// send values in not sorted order to assert that the latest detection is right
+				rawmsg := json.RawMessage(fmt.Sprintf(`{"streams":[{"stream":{"key":"stream1","level":"warn"},"values":[["%d","second logline"],["%d","newest logline"],["%d","oldest logline"]]}],"dropped_entities":[]}`, t1, t2, t0))
+				err = conn.WriteJSON(rawmsg)
+				require.NoError(t, err)
+
+				// wait the flush of the message on the network
+				time.Sleep(5 * time.Millisecond)
+
 				// it generates a failure closing the connection
 				// in a rude way
 				err = conn.Close()
-				if err != nil {
-					return
-				}
+				require.NoError(t, err)
 
-				m.Lock()
-				firstAttempt = start
-				m.Unlock()
+				time.Sleep(time.Millisecond)
 				return
 			}
 
-			// it asserts that the second attempt
-			// has a `start` after the first
-			require.True(t, start.After(firstAttempt))
+			// assert that the client created the request with `start`
+			// populated from the most recent seen value (t2)
+			require.Equal(t, time.Unix(0, 1627351200000000000), start)
 
 			// send a correct logline so we will able to assert
 			// that the connection is restored as expected
-			err = conn.WriteJSON(json.RawMessage(`{"streams":[{"stream":{"key1":"v1","level":"warn"},"values":[["1598282752000000000","logline-after-restored-conn"]]}],"dropped_entities":[]}`))
+			err = conn.WriteJSON(json.RawMessage(generateLogline("stream3", 1627358400000000000, "logline-after-restored-conn")))
 			require.NoError(t, err)
 
+			// wait the flush of the message on the network
 			time.Sleep(time.Millisecond)
 			cancel()
 		})
@@ -345,11 +352,77 @@ func TestStreamLogsToLogger(t *testing.T) {
 		err := c.StreamLogsToLogger(ctx, logger, "ref_id", 0)
 		require.NoError(t, err)
 
-		assert.NotZero(t, firstAttempt)
 		assert.Equal(t,
 			[]string{
-				"error reading a message from the cloud",
-				"trying to establish a fresh connection with the tail logs, this might result in either some repeated or missed messages",
+				"second logline",
+				"newest logline",
+				"oldest logline",
+				"error reading a log message from the cloud, trying to establish a fresh connection with the logs service...",
+				"logline-after-restored-conn",
+			}, logLines(hook))
+	})
+
+	t.Run("RestoreConnFromTimeNow", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		startFilter := func(u url.URL) (start time.Time, err error) {
+			rawstart, err := strconv.ParseInt(u.Query().Get("start"), 10, 64)
+			if err != nil {
+				return start, err
+			}
+
+			start = time.Unix(0, rawstart)
+			return
+		}
+
+		var requestsCount uint64
+		t0 := time.Now()
+
+		tb := httpmultibin.NewHTTPMultiBin(t)
+		logtailHandleFunc(tb, func(conn *websocket.Conn, req *http.Request) {
+			requests := atomic.AddUint64(&requestsCount, 1)
+
+			start, err := startFilter(*req.URL)
+			require.NoError(t, err)
+
+			if requests <= 1 {
+				// if it's the first attempt then
+				// it generates a failure closing the connection
+				// in a rude way
+				err = conn.Close()
+				require.NoError(t, err)
+				return
+			}
+
+			// it asserts that the second attempt
+			// has a `start` after the test run
+			require.True(t, start.After(t0))
+
+			// send a correct logline so we will able to assert
+			// that the connection is restored as expected
+			err = conn.WriteJSON(json.RawMessage(`{"streams":[{"stream":{"key":"stream1","level":"warn"},"values":[["1598282752000000000","logline-after-restored-conn"]]}],"dropped_entities":[]}`))
+			require.NoError(t, err)
+
+			// wait the flush of the message on the network
+			time.Sleep(time.Millisecond)
+			cancel()
+		})
+
+		logger := logrus.New()
+		logger.Out = ioutil.Discard
+		hook := &testutils.SimpleLogrusHook{HookedLevels: logrus.AllLevels}
+		logger.AddHook(hook)
+
+		c := configFromHTTPMultiBin(tb)
+		err := c.StreamLogsToLogger(ctx, logger, "ref_id", 0)
+		require.NoError(t, err)
+
+		assert.Equal(t,
+			[]string{
+				"error reading a log message from the cloud, trying to establish a fresh connection with the logs service...",
 				"logline-after-restored-conn",
 			}, logLines(hook))
 	})

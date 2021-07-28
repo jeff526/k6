@@ -227,12 +227,13 @@ type timestampTrack struct {
 	ts int64
 }
 
-// TimeOrNow returns as Time the latest tracked value
+// TimeOrNow returns as Time the latest tracked value plus 1ms
 // or Now as the default value.
 func (tst *timestampTrack) TimeOrNow() (t time.Time) {
 	t = time.Now()
 	if ts := atomic.LoadInt64(&tst.ts); ts > 0 {
-		t = time.Unix(0, ts)
+		// add 1ms for avoid possible repetition
+		t = time.Unix(0, ts).Add(1 * time.Millisecond)
 	}
 	return
 }

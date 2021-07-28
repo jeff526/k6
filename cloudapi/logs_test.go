@@ -330,8 +330,8 @@ func TestStreamLogsToLogger(t *testing.T) {
 			}
 
 			// assert that the client created the request with `start`
-			// populated from the most recent seen value (t2)
-			require.Equal(t, time.Unix(0, 1627351200000000000), start)
+			// populated from the most recent seen value (t2+1ms)
+			require.Equal(t, time.Unix(0, 1627351200001000000), start)
 
 			// send a correct logline so we will able to assert
 			// that the connection is restored as expected
